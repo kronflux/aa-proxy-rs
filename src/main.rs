@@ -390,6 +390,71 @@ fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
     output
 }
 
+/// Compute the HT40 extension direction for a given channel.
+/// Returns "+", "-", or "" (no 40 MHz support for this channel).
+fn ht40_direction(channel: u8, band: &str) -> &'static str {
+    match band {
+        "5" | "6" => {
+            // 5 GHz: lower channel of each pair uses HT40+, upper uses HT40-
+            // Channel 165 is standalone (no 40 MHz pairing)
+            if channel == 165 {
+                ""
+            } else if (channel / 4) % 2 == 1 {
+                "+"
+            } else {
+                "-"
+            }
+        }
+        _ => {
+            // 2.4 GHz: channels 1-7 can use HT40+, 8-13 use HT40-
+            // Channel 14 has no HT40 support
+            if channel >= 1 && channel <= 7 {
+                "+"
+            } else if channel >= 8 && channel <= 13 {
+                "-"
+            } else {
+                ""
+            }
+        }
+    }
+}
+
+/// Build the ht_capab string for hostapd based on channel and band.
+fn build_ht_capab(channel: u8, band: &str) -> String {
+    let mut caps = Vec::new();
+
+    let dir = ht40_direction(channel, band);
+    if !dir.is_empty() {
+        caps.push(format!("HT40{}", dir));
+    }
+
+    caps.push("SHORT-GI-20".to_string());
+
+    if !dir.is_empty() {
+        caps.push("SHORT-GI-40".to_string());
+    }
+
+    caps.push("MAX-AMSDU-3839".to_string());
+
+    // DSSS_CCK-40 is only relevant for 2.4 GHz with 40 MHz channels
+    if band != "5" && band != "6" && !dir.is_empty() {
+        caps.push("DSSS_CCK-40".to_string());
+    }
+
+    caps.iter().map(|c| format!("[{}]", c)).collect()
+}
+
+/// Compute the VHT center frequency segment 0 index for 20/40 MHz operation.
+/// For HT40+ pairs the center is primary + 2, for HT40- it is primary - 2.
+fn vht_center_freq(channel: u8, band: &str) -> u8 {
+    let dir = ht40_direction(channel, band);
+    match dir {
+        "+" => channel + 2,
+        "-" => channel - 2,
+        _ => channel,
+    }
+}
+
 fn generate_hostapd_conf(config: AppConfig) -> std::io::Result<()> {
     info!(
         "{} 🗃️ Generating config from input template: <bold><green>{}</>",
@@ -405,6 +470,27 @@ fn generate_hostapd_conf(config: AppConfig) -> std::io::Result<()> {
 
     let template = fs::read_to_string(HOSTAPD_CONF_IN)?;
 
+    let ht_capab = if config.wifi_version >= 4 {
+        build_ht_capab(config.channel, &config.band)
+    } else {
+        String::new()
+    };
+
+    let is_5ghz_ac = (config.band == "5" || config.band == "6") && config.wifi_version >= 5;
+    let vht_oper_chwidth = if is_5ghz_ac { "0" } else { "" };
+    let vht_centr_freq = if is_5ghz_ac {
+        vht_center_freq(config.channel, &config.band).to_string()
+    } else {
+        String::new()
+    };
+
+    // OBSS scan: useful on 2.4 GHz to handle 20/40 coexistence, not needed on 5 GHz
+    let obss_interval = if config.band == "5" || config.band == "6" {
+        "0"
+    } else {
+        "300"
+    };
+
     // Eventually: For 6 GHz, we will need more options like opclass.
     let rendered = render_template(
         &template,
@@ -414,6 +500,10 @@ fn generate_hostapd_conf(config: AppConfig) -> std::io::Result<()> {
             ("AX_MODE", if config.wifi_version >= 6 { "1" } else { "0" }),
             ("AC_MODE", if config.wifi_version >= 5 { "1" } else { "0" }),
             ("N_MODE", if config.wifi_version >= 4 { "1" } else { "0" }),
+            ("HT_CAPAB", &ht_capab),
+            ("VHT_OPER_CHWIDTH", vht_oper_chwidth),
+            ("VHT_CENTR_FREQ", &vht_centr_freq),
+            ("OBSS_INTERVAL", obss_interval),
             ("COUNTRY_CODE", &config.country_code),
             ("CHANNEL", &config.channel.to_string()),
             ("SSID", &config.ssid),
