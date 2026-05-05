@@ -531,6 +531,18 @@ fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
         let placeholder = format!("{{{{{}}}}}", key);
         output = output.replace(&placeholder, value);
     }
+
+    // Warn about and remove any unresolved template variables
+    let re = regex::Regex::new(r"\{\{[A-Z_][A-Z0-9_]*\}\}").unwrap();
+    let unresolved: Vec<&str> = re.find_iter(&output).map(|m| m.as_str()).collect();
+    if !unresolved.is_empty() {
+        warn!(
+            "{} Unresolved template variables (replaced with empty): {:?}",
+            NAME, unresolved
+        );
+        output = re.replace_all(&output, "").to_string();
+    }
+
     output
 }
 
@@ -545,6 +557,41 @@ fn generate_hostapd_conf(config: AppConfig) -> std::io::Result<()> {
         "a"
     } else {
         "g"
+    };
+
+    // Generate channel-aware HT capabilities based on channel and band
+    let ht_capab = if config.band == "2" || config.band == "2.4" {
+        let ht40_direction = match config.channel {
+            1..=7 => "+",
+            8..=14 => "-",
+            _ => "+",
+        };
+        format!(
+            "[HT40{}][SHORT-GI-20][SHORT-GI-40][MAX-AMSDU-3839][DSSS_CCK-40]",
+            ht40_direction
+        )
+    } else {
+        "[HT40+][SHORT-GI-20][SHORT-GI-40][MAX-AMSDU-3839]".to_string()
+    };
+
+    let vht_oper_chwidth = if config.band == "5" { "0" } else { "" };
+
+    let vht_centr_freq = if config.band == "5" {
+        let ht40_direction = match config.channel {
+            36 | 44 | 52 | 60 | 100 | 108 | 116 | 124 | 132 | 140 | 149 | 157 => "+",
+            40 | 48 | 56 | 64 | 104 | 112 | 120 | 128 | 136 | 144 | 153 | 161 => "-",
+            _ => "+",
+        };
+        let offset = 2 * if ht40_direction == "+" { 1 } else { -1 };
+        format!("{}", config.channel as i32 + offset)
+    } else {
+        String::new()
+    };
+
+    let obss_interval = if config.band == "2" || config.band == "2.4" {
+        "300"
+    } else {
+        "0"
     };
 
     let template = fs::read_to_string(HOSTAPD_CONF_IN)?;
@@ -562,6 +609,10 @@ fn generate_hostapd_conf(config: AppConfig) -> std::io::Result<()> {
             ("CHANNEL", &config.channel.to_string()),
             ("SSID", &config.ssid),
             ("WPA_PASSPHRASE", &config.wpa_passphrase),
+            ("HT_CAPAB", &ht_capab),
+            ("VHT_OPER_CHWIDTH", vht_oper_chwidth),
+            ("VHT_CENTR_FREQ", &vht_centr_freq),
+            ("OBSS_INTERVAL", obss_interval),
         ],
     );
 
